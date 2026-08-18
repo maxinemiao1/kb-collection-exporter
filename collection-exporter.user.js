@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         全能收藏导出器（小红书 / B站 / 百度网盘）v1.0
+// @name         全能收藏导出器（小红书 / B站 / 百度网盘）v2.0
 // @namespace    http://workbuddy.ai/
-// @version      1.0
-// @description  在小红书收藏页 / B站收藏夹 / 百度网盘 一键导出收藏为 JSON（本地生成，Cookie 不出浏览器）
+// @version      2.0
+// @description  在小红书收藏页 / B站收藏夹 / 百度网盘 导出收藏为 JSON（本地生成，Cookie 不出浏览器）。带实时条数显示与「停止并导出」按钮。
 // @author       王经理 (WorkBuddy)
 // @match        https://www.xiaohongshu.com/*
 // @match        https://edith.xiaohongshu.com/*
@@ -29,48 +29,67 @@
     const a = document.createElement('a');
     a.href = URL.createObjectURL(b);
     a.download = filename;
+    document.body.appendChild(a);
     a.click();
+    setTimeout(function () { document.body.removeChild(a); }, 0);
     return data.count;
   }
 
-  function scrollDown() {
+  // 滚动加载到底；stopFn() 返回 true 时立即中断；tickFn() 每滚一次回调（用于刷新条数）
+  function scrollDown(stopFn, tickFn) {
     return (async function () {
       let lh = 0, s = 0;
-      for (let i = 0; i < 300; i++) {
+      for (let i = 0; i < 600; i++) {
+        if (stopFn()) break;
         window.scrollTo(0, document.body.scrollHeight);
-        await sleep(1000);
+        await sleep(700);
         const h = document.body.scrollHeight;
         if (h === lh) { s++; if (s >= 2) break; } else { s = 0; }
         lh = h;
+        if (tickFn) tickFn();
       }
     })();
   }
 
-  function mountButton(color, text, tipText, onClick) {
+  // 统一按钮：空闲态「📥 导出」→ 运行中「⏹ 停止 (N条)」→ 点停止则中断并导出已抓部分
+  // run(ctrl) 为异步抓取逻辑，需自行调用 scrollDown(ctrl.stop, ctrl.tick) 并 return 条数
+  function makeExporter(color, idleText, tipBase, run) {
+    const st = { running: false, stopped: false };
     const btn = document.createElement('div');
     btn.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:99999;background:' + color +
       ';color:#fff;padding:10px 16px;border-radius:24px;font:14px/1.4 -apple-system,"PingFang SC",sans-serif;' +
       'cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25);user-select:none;';
-    btn.textContent = text;
+    btn.textContent = idleText;
     const tip = document.createElement('div');
     tip.style.cssText = 'position:fixed;right:16px;bottom:56px;z-index:99999;background:#222;color:#fff;' +
       'padding:6px 12px;border-radius:10px;font:12px/1.4 -apple-system,"PingFang SC",sans-serif;' +
-      'max-width:260px;box-shadow:0 4px 14px rgba(0,0,0,.25);display:none;';
-    btn.addEventListener('click', async function () {
-      tip.style.display = 'block';
-      tip.textContent = tipText;
-      btn.textContent = '⏳ 导出中…';
-      await onClick();
-      setTimeout(function () { tip.style.display = 'none'; }, 4000);
-    });
-    function m() {
-      if (!document.body.contains(btn)) {
-        document.body.appendChild(btn);
-        document.body.appendChild(tip);
-      }
+      'max-width:280px;box-shadow:0 4px 14px rgba(0,0,0,.25);display:none;white-space:pre-line;';
+    function mount() {
+      if (!document.body.contains(btn)) { document.body.appendChild(btn); document.body.appendChild(tip); }
     }
-    if (document.body) m(); else window.addEventListener('load', m);
-    return { btn: btn, tip: tip };
+    if (document.body) mount(); else window.addEventListener('load', mount);
+
+    const ctrl = {
+      stop: function () { return st.stopped; },
+      tick: function () {}
+    };
+    btn.addEventListener('click', async function () {
+      if (!st.running) {
+        st.running = true; st.stopped = false;
+        btn.textContent = '⏹ 停止 (0 条)';
+        tip.style.display = 'block';
+        tip.textContent = tipBase + '\n已抓 0 条（点按钮可随时停止并导出）';
+        ctrl.tick = function () { btn.textContent = '⏹ 停止 (' + (window.__capLen || 0) + ' 条)'; };
+        const c = await run(ctrl);
+        st.running = false;
+        btn.textContent = '📥 再导一次 (' + c + ')';
+        tip.textContent = '✅ 已导出 ' + c + ' 条，把 JSON 发给王主管即可。';
+        setTimeout(function () { tip.style.display = 'none'; }, 6000);
+      } else {
+        st.stopped = true;
+        btn.textContent = '⏳ 正在导出已抓到的…';
+      }
+    });
   }
 
   function hookFetch(matcher, walker) {
@@ -133,12 +152,13 @@
       });
     }
     hookFetch(/note|collect|feed|v1\//, walk);
-    const ui = mountButton('#ff2e4d', '📥 导出收藏', '正在滚动加载收藏，请稍候…（翻到底自动停）', async function () {
-      await scrollDown();
+    makeExporter('#ff2e4d', '📥 导出收藏', '小红书：正在滚动加载收藏…', async function (ctrl) {
+      window.__capLen = cap.length;
+      const _push = pushN;
+      await scrollDown(ctrl.stop, function () { window.__capLen = cap.length; });
       dom();
-      const c = download({ source: 'xiaohongshu_collect', exportedAt: new Date().toISOString(), count: cap.length, notes: cap }, 'xiaohongshu_collect_' + Date.now() + '.json');
-      ui.tip.textContent = '✅ 已导出 ' + c + ' 条，把 JSON 发给王主管即可。';
-      ui.btn.textContent = '📥 再导一次';
+      window.__capLen = cap.length;
+      return download({ source: 'xiaohongshu_collect', exportedAt: new Date().toISOString(), count: cap.length, notes: cap }, 'xiaohongshu_collect_' + Date.now() + '.json');
     });
   }
 
@@ -187,12 +207,12 @@
       });
     }
     hookFetch(/fav|x\/v3\/fav|x\/v2\/history|watchlater/, walk);
-    const ui = mountButton('#fb7299', '📥 导出B站收藏', '滚动加载中…', async function () {
-      await scrollDown();
+    makeExporter('#fb7299', '📥 导出B站收藏', 'B站：正在滚动加载收藏夹…', async function (ctrl) {
+      window.__capLen = cap.length;
+      await scrollDown(ctrl.stop, function () { window.__capLen = cap.length; });
       dom();
-      const c = download({ source: 'bilibili_fav', exportedAt: new Date().toISOString(), count: cap.length, notes: cap }, 'bilibili_fav_' + Date.now() + '.json');
-      ui.tip.textContent = '✅ 已导出 ' + c + ' 条，发王主管即可。';
-      ui.btn.textContent = '📥 再导一次';
+      window.__capLen = cap.length;
+      return download({ source: 'bilibili_fav', exportedAt: new Date().toISOString(), count: cap.length, notes: cap }, 'bilibili_fav_' + Date.now() + '.json');
     });
   }
 
@@ -237,12 +257,12 @@
       });
     }
     hookFetch(/pan\.baidu\.com\/api\/(list|filemetas)/, walk);
-    const ui = mountButton('#2e7fff', '📥 导出网盘清单', '滚动加载中（文件多请耐心）…', async function () {
-      await scrollDown();
+    makeExporter('#2e7fff', '📥 导出网盘清单', '网盘：正在滚动加载文件清单…', async function (ctrl) {
+      window.__capLen = cap.length;
+      await scrollDown(ctrl.stop, function () { window.__capLen = cap.length; });
       dom();
-      const c = download({ source: 'baidu_pan_list', note: '仅文件索引清单，未下载任何文件内容', exportedAt: new Date().toISOString(), count: cap.length, files: cap }, 'baidu_pan_' + Date.now() + '.json');
-      ui.tip.textContent = '✅ 已导出 ' + c + ' 条文件索引，发王主管即可。';
-      ui.btn.textContent = '📥 再导一次';
+      window.__capLen = cap.length;
+      return download({ source: 'baidu_pan_list', note: '仅文件索引清单，未下载任何文件内容', exportedAt: new Date().toISOString(), count: cap.length, files: cap }, 'baidu_pan_' + Date.now() + '.json');
     });
   }
 })();
