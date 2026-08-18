@@ -164,9 +164,10 @@
     // 唯一能过验证的是"在列表/收藏页点开帖子"这种 App 内部跳转。所以这里模拟真人点击卡片→抓弹窗正文→关掉。
     async function scrapeViaClick(id, ctrl) {
       function findCard() {
-        const a = document.querySelector('a[href*="/explore/' + id + '"]');
+        const sel = 'a[href*="/explore/' + id + '"], a[href*="/discovery/item/' + id + '"]';
+        const a = document.querySelector(sel);
         if (a) return a;
-        const all = document.querySelectorAll('a[href*="/explore/"]');
+        const all = document.querySelectorAll('a[href*="/explore/"], a[href*="/discovery/item/"]');
         for (let i = 0; i < all.length; i++) { if ((all[i].getAttribute('href') || '').indexOf(id) >= 0) return all[i]; }
         return null;
       }
