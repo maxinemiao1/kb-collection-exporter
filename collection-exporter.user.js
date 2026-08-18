@@ -76,13 +76,14 @@
         const ctrl = {
           stop: function () { return st.stopped; },
           setBtn: function (t) { btn.textContent = t; },
-          setTip: function (t) { tip.textContent = t; }
+          setTip: function (t) { tip.textContent = t; },
+          finalTip: ''   // run 可填入"抓不到正文"等警告，结束时不覆盖
         };
         const c = await run(ctrl);
         st.running = false;
         btn.textContent = '📥 再导一次 (' + c + ')';
-        tip.textContent = '✅ 已导出 ' + c + ' 条，把 JSON 发给王主管即可。';
-        setTimeout(function () { tip.style.display = 'none'; }, 6000);
+        tip.textContent = ctrl.finalTip || ('✅ 已导出 ' + c + ' 条，把 JSON 发给王主管即可。');
+        setTimeout(function () { tip.style.display = 'none'; }, 9000);
       } else {
         st.stopped = true;
         btn.textContent = '⏳ 正在导出已抓到的…';
@@ -194,11 +195,12 @@
         const r = await fetch('/explore/' + id, { credentials: 'include' });
         const html = await r.text();
 
-        // 2a) __INITIAL_STATE__（最可靠，含完整正文）
-        const sm = html.match(/window\.__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});\s*<\/script>/);
+        // 2a) __INITIAL_STATE__（最可靠，含完整正文）。
+        //     注意：用整个 <script> 块抓取，再 JSON.parse；不能用 (\{...*\})，嵌套 JSON 会提前在第一个 } 截断。
+        const sm = html.match(/<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*([\s\S]*?)<\/script>/i);
         if (sm) {
           try {
-            const state = JSON.parse(sm[1]);
+            const state = JSON.parse(sm[1].trim().replace(/;\s*$/, ''));
             const note = findNote(state, id);
             if (note && note.desc) {
               return {
@@ -255,6 +257,10 @@
       ctrl.setBtn('⏹ 阶段1 已抓 ' + cap.length + '，准备抓详情…');
       ctrl.setTip('小红书：阶段1 完成，共 ' + cap.length + ' 条。\n开始阶段2 抓正文（已登录的浏览器才会有正文）。\n点按钮可随时停止并导出当前内容。');
       await enrichDetails(ctrl);
+      const filled = cap.filter(function (c) { return (c.desc || '').trim(); }).length;
+      if (filled === 0 && cap.length > 0) {
+        ctrl.finalTip = '⚠️ 抓到 ' + cap.length + ' 条，但一条正文都没拿到。\n小红书把这台浏览器的详情接口挡住了。\n请改用：在收藏页点进任意一篇帖子→等正文加载→再点导出；或联系王主管换更硬的方案。';
+      }
       return download({
         source: 'xiaohongshu_collect',
         exportedAt: new Date().toISOString(),
