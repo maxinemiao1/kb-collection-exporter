@@ -145,39 +145,69 @@
     hookFetch(/note|collect|feed|v1\//, walk);
 
     // 阶段2：逐条拉详情，把 desc/tags/interact 补全
+    // 双保险：1) 试详情 API；2) API 没拿到 desc 就抓帖子页 HTML 的 og:description
+    async function enrichOne(id) {
+      // 1) 详情 API（需要登录 cookie；可能因缺签名头失败）
+      try {
+        const r = await fetch('/api/sns/web/v1/feed', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            source_note_id: id,
+            image_formats: ['jpg', 'webp', 'avif'],
+            extra: { need_body_topic: '1' }
+          })
+        });
+        const d = await r.json();
+        const items = (d && d.data && d.data.items) || [];
+        const item = items.find(function (it) { return it && it.note && String(it.note.note_id) === id; });
+        if (item && item.note && item.note.desc) {
+          const n = item.note;
+          return {
+            desc: n.desc,
+            title: n.title || '',
+            time: n.time || 0,
+            liked: (n.interact_info && n.interact_info.liked_count) || '',
+            user: (n.user && n.user.nickname) || '',
+            tags: Array.isArray(n.tag_list) ? n.tag_list.map(function (t) { return t && (t.name || t); }).filter(Boolean) : [],
+            images: Array.isArray(n.image_list) ? n.image_list.map(function (im) { return im.url || im; }).filter(Boolean) : []
+          };
+        }
+      } catch (e) { /* 继续走 fallback */ }
+
+      // 2) Fallback：抓 explore 页面 HTML，提取 og:description（xhs 分享卡片必有，无需签名）
+      try {
+        const r = await fetch('/explore/' + id, { credentials: 'include' });
+        const html = await r.text();
+        const og = (html.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']*)/i) || [])[1] || '';
+        const titleOg = (html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']*)/i) || [])[1] || '';
+        const desc = og ? og.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>') : '';
+        const title = titleOg ? titleOg.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'") : '';
+        if (desc || title) return { desc: desc, title: title, time: 0, liked: '', user: '', tags: [], images: [] };
+      } catch (e) { /* 放弃这条 */ }
+
+      return null;
+    }
     async function enrichDetails(ctrl) {
       const ids = cap.map(function (c) { return c.id; });
       for (let i = 0; i < ids.length; i++) {
         if (ctrl.stop()) break;
         const id = ids[i];
         ctrl.setBtn('⏹ 抓详情 ' + (i + 1) + '/' + ids.length);
-        ctrl.setTip('小红书：阶段2 抓取正文（需要已登录）…\n' + (i + 1) + '/' + ids.length + '（点按钮可随时停）');
-        try {
-          const r = await fetch('/api/sns/web/v1/feed', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              source_note_id: id,
-              image_formats: ['jpg', 'webp', 'avif'],
-              extra: { need_body_topic: '1' }
-            })
-          });
-          const d = await r.json();
-          const item = (d && d.data && d.data.items || []).find(function (it) { return it && it.note && String(it.note.note_id) === id; });
-          if (item && item.note) {
-            const n = item.note;
-            const entry = cap.find(function (c) { return c.id === id; });
-            if (entry) {
-              entry.desc = n.desc || entry.desc || '';
-              entry.title = n.title || entry.title;
-              entry.time = n.time || entry.time;
-              entry.liked = (n.interact_info && n.interact_info.liked_count) || entry.liked;
-              if (n.user && n.user.nickname) entry.user = n.user.nickname;
-              if (Array.isArray(n.tag_list)) entry.tags = n.tag_list.map(function (t) { return t && (t.name || t); }).filter(Boolean);
-              if (Array.isArray(n.image_list) && n.image_list.length) entry.images = n.image_list.map(function (im) { return im.url || im; }).filter(Boolean);
-            }
+        ctrl.setTip('小红书：阶段2 抓正文…\n' + (i + 1) + '/' + ids.length + '（点按钮可随时停）');
+        const got = await enrichOne(id);
+        if (got) {
+          const entry = cap.find(function (c) { return c.id === id; });
+          if (entry) {
+            if (got.desc) entry.desc = got.desc;
+            if (got.title) entry.title = got.title;
+            if (got.time) entry.time = got.time;
+            if (got.liked) entry.liked = got.liked;
+            if (got.user) entry.user = got.user;
+            if (got.tags && got.tags.length) entry.tags = got.tags;
+            if (got.images && got.images.length) entry.images = got.images;
           }
-        } catch (e) { /* 单条失败不影响其余 */ }
+        }
         await sleep(350); // 礼貌节流，避免触发反爬
       }
     }
