@@ -160,53 +160,41 @@
       for (const k in obj) { const r = findNote(obj[k], id); if (r) return r; }
       return null;
     }
-    // 用隐藏 iframe 加载帖子页（等同真人打开：走浏览器导航、执行JS、SSR 状态 + 渲染后的 DOM 都在）。
-    // 关键：fetch 会带 Sec-Fetch-Mode:cors，小红书据此返回壳页面；iframe 走 navigate，拿到完整内容。
-    function loadInFrame(id) {
-      return new Promise(function (resolve) {
-        const f = document.createElement('iframe');
-        f.style.cssText = 'position:fixed;left:-99999px;top:0;width:1px;height:1px;opacity:0;border:0;';
-        let done = false;
-        function finish(v) { if (done) return; done = true; clearTimeout(timer); try { if (f.parentNode) f.parentNode.removeChild(f); } catch (e) {} resolve(v); }
-        const timer = setTimeout(function () { finish(null); }, 12000);
-        f.onload = function () {
-          try {
-            const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
-            if (!doc || !doc.documentElement) { finish(null); return; }
-            const html = doc.documentElement.innerHTML;
-            // a) SSR 状态（结构化数据，最稳）
-            const sm = html.match(/<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*([\s\S]*?)<\/script>/i);
-            if (sm) {
-              try {
-                const state = JSON.parse(sm[1].trim().replace(/;\s*$/, ''));
-                const note = findNote(state, id);
-                if (note && note.desc) {
-                  finish({
-                    desc: unesc(note.desc), title: unesc(note.title || ''),
-                    time: note.time || note.create_time || 0,
-                    liked: (note.interact_info && note.interact_info.liked_count) || '',
-                    user: (note.user && (note.user.nickname || note.user.username)) || '',
-                    tags: Array.isArray(note.tag_list) ? note.tag_list.map(function (t) { return t && (t.name || t); }).filter(Boolean) : [],
-                    images: Array.isArray(note.image_list) ? note.image_list.map(function (im) { return im.url || im; }).filter(Boolean) : []
-                  }); return;
-                }
-              } catch (e) { /* 解析失败，走 DOM */ }
-            }
-            // b) 渲染后的 DOM（兜底）
-            const grab = function () {
-              const el = doc.querySelector('#detail-desc, .note-content, .desc, .content, [class*="noteText"], [class*="note-detail"] .desc');
-              return (el && el.innerText && el.innerText.trim()) ? el.innerText.trim() : '';
-            };
-            const t = grab();
-            if (t) { finish({ desc: t, title: '', time: 0, liked: '', user: '', tags: [], images: [] }); return; }
-            // 等 JS 渲染再试一次
-            setTimeout(function () { const t2 = grab(); finish(t2 ? { desc: t2, title: '', time: 0, liked: '', user: '', tags: [], images: [] } : null); }, 1600);
-          } catch (e) { finish(null); }
-        };
-        f.onerror = function () { finish(null); };
-        f.src = 'https://www.xiaohongshu.com/explore/' + id;
-        document.body.appendChild(f);
-      });
+    // 直接 fetch/iframe 打开 /explore/{id} 会被小红书反爬墙（302 跳"笔记暂时无法浏览"）。
+    // 唯一能过验证的是"在列表/收藏页点开帖子"这种 App 内部跳转。所以这里模拟真人点击卡片→抓弹窗正文→关掉。
+    async function scrapeViaClick(id, ctrl) {
+      function findCard() {
+        const a = document.querySelector('a[href*="/explore/' + id + '"]');
+        if (a) return a;
+        const all = document.querySelectorAll('a[href*="/explore/"]');
+        for (let i = 0; i < all.length; i++) { if ((all[i].getAttribute('href') || '').indexOf(id) >= 0) return all[i]; }
+        return null;
+      }
+      const card = findCard();
+      if (!card) return null;
+      const before = location.href;
+      try { card.click(); } catch (e) { return null; }
+      let got = null;
+      for (let i = 0; i < 20; i++) {            // 最多 ~8s 等正文渲染
+        await sleep(400);
+        const el = document.querySelector('#detail-desc, .note-content, .desc, [class*="noteText"], [class*="note-content"]');
+        if (el && el.innerText && el.innerText.trim()) { got = el.innerText.trim(); break; }
+      }
+      // 恢复现场：弹窗按 Esc，整页跳转则后退
+      try {
+        if (location.href === before) document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+        else history.back();
+      } catch (e) {}
+      await sleep(450);
+      if (!got) return null;
+      let title = '', user = '';
+      try {
+        const t = document.querySelector('#detail-title, .note-detail-title, .title');
+        if (t) title = t.innerText.trim();
+        const u = document.querySelector('.author-wrapper .name, .username, [class*="author"] .name');
+        if (u) user = u.innerText.trim();
+      } catch (e) {}
+      return { desc: got, title: title, time: 0, liked: '', user: user, tags: [], images: [] };
     }
     async function enrichOne(id) {
       // 1) 详情 API（需要登录 cookie；可能因缺签名头失败）
@@ -237,9 +225,9 @@
         }
       } catch (e) { /* 继续走 fallback */ }
 
-      // 2) Fallback：用隐藏 iframe 走真实导航加载帖子页（拿 SSR 状态 + 渲染后的 DOM），比 fetch 稳
+      // 2) Fallback：模拟真人点开帖子卡片，抓弹窗/正文 DOM（能过反爬墙，fetch/iframe 都不行）
       try {
-        const fr = await loadInFrame(id);
+        const fr = await scrapeViaClick(id, ctrl);
         if (fr) return fr;
       } catch (e) { /* 放弃这条 */ }
 
@@ -251,7 +239,7 @@
         if (ctrl.stop()) break;
         const id = ids[i];
         ctrl.setBtn('⏹ 抓详情 ' + (i + 1) + '/' + ids.length);
-        ctrl.setTip('小红书：阶段2 抓正文…\n' + (i + 1) + '/' + ids.length + '（点按钮可随时停）');
+        ctrl.setTip('小红书：阶段2 逐篇点开抓正文…\n' + (i + 1) + '/' + ids.length + '（会自动开/关帖子，别手动操作，点按钮可随时停）');
         const got = await enrichOne(id);
         if (got) {
           const entry = cap.find(function (c) { return c.id === id; });
@@ -277,7 +265,7 @@
       await enrichDetails(ctrl);
       const filled = cap.filter(function (c) { return (c.desc || '').trim(); }).length;
       if (filled === 0 && cap.length > 0) {
-        ctrl.finalTip = '⚠️ 抓到 ' + cap.length + ' 条，但一条正文都没拿到。\n小红书把 iframe/接口都挡了。\n请改用：在收藏页点进任意一篇帖子→等正文加载→再点导出；或联系王主管换更硬的方案。';
+        ctrl.finalTip = '⚠️ 抓到 ' + cap.length + ' 条，但一条正文都没拿到。\n小红书把接口/iframe 都挡了，自动点开也失败。\n请改用：在收藏页手动点进任意一篇帖子→等正文加载→再点导出；或联系王主管换更硬的方案。';
       }
       return download({
         source: 'xiaohongshu_collect',
