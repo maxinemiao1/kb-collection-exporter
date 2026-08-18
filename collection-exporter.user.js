@@ -160,6 +160,54 @@
       for (const k in obj) { const r = findNote(obj[k], id); if (r) return r; }
       return null;
     }
+    // 用隐藏 iframe 加载帖子页（等同真人打开：走浏览器导航、执行JS、SSR 状态 + 渲染后的 DOM 都在）。
+    // 关键：fetch 会带 Sec-Fetch-Mode:cors，小红书据此返回壳页面；iframe 走 navigate，拿到完整内容。
+    function loadInFrame(id) {
+      return new Promise(function (resolve) {
+        const f = document.createElement('iframe');
+        f.style.cssText = 'position:fixed;left:-99999px;top:0;width:1px;height:1px;opacity:0;border:0;';
+        let done = false;
+        function finish(v) { if (done) return; done = true; clearTimeout(timer); try { if (f.parentNode) f.parentNode.removeChild(f); } catch (e) {} resolve(v); }
+        const timer = setTimeout(function () { finish(null); }, 12000);
+        f.onload = function () {
+          try {
+            const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+            if (!doc || !doc.documentElement) { finish(null); return; }
+            const html = doc.documentElement.innerHTML;
+            // a) SSR 状态（结构化数据，最稳）
+            const sm = html.match(/<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*([\s\S]*?)<\/script>/i);
+            if (sm) {
+              try {
+                const state = JSON.parse(sm[1].trim().replace(/;\s*$/, ''));
+                const note = findNote(state, id);
+                if (note && note.desc) {
+                  finish({
+                    desc: unesc(note.desc), title: unesc(note.title || ''),
+                    time: note.time || note.create_time || 0,
+                    liked: (note.interact_info && note.interact_info.liked_count) || '',
+                    user: (note.user && (note.user.nickname || note.user.username)) || '',
+                    tags: Array.isArray(note.tag_list) ? note.tag_list.map(function (t) { return t && (t.name || t); }).filter(Boolean) : [],
+                    images: Array.isArray(note.image_list) ? note.image_list.map(function (im) { return im.url || im; }).filter(Boolean) : []
+                  }); return;
+                }
+              } catch (e) { /* 解析失败，走 DOM */ }
+            }
+            // b) 渲染后的 DOM（兜底）
+            const grab = function () {
+              const el = doc.querySelector('#detail-desc, .note-content, .desc, .content, [class*="noteText"], [class*="note-detail"] .desc');
+              return (el && el.innerText && el.innerText.trim()) ? el.innerText.trim() : '';
+            };
+            const t = grab();
+            if (t) { finish({ desc: t, title: '', time: 0, liked: '', user: '', tags: [], images: [] }); return; }
+            // 等 JS 渲染再试一次
+            setTimeout(function () { const t2 = grab(); finish(t2 ? { desc: t2, title: '', time: 0, liked: '', user: '', tags: [], images: [] } : null); }, 1600);
+          } catch (e) { finish(null); }
+        };
+        f.onerror = function () { finish(null); };
+        f.src = 'https://www.xiaohongshu.com/explore/' + id;
+        document.body.appendChild(f);
+      });
+    }
     async function enrichOne(id) {
       // 1) 详情 API（需要登录 cookie；可能因缺签名头失败）
       try {
@@ -189,40 +237,10 @@
         }
       } catch (e) { /* 继续走 fallback */ }
 
-      // 2) Fallback：抓 explore 页面 HTML。
-      //    小红书现在多数不注入 og:description（防爬），但 SSR 一定在 window.__INITIAL_STATE__ 里放完整 note（含 desc）。
+      // 2) Fallback：用隐藏 iframe 走真实导航加载帖子页（拿 SSR 状态 + 渲染后的 DOM），比 fetch 稳
       try {
-        const r = await fetch('/explore/' + id, { credentials: 'include' });
-        const html = await r.text();
-
-        // 2a) __INITIAL_STATE__（最可靠，含完整正文）。
-        //     注意：用整个 <script> 块抓取，再 JSON.parse；不能用 (\{...*\})，嵌套 JSON 会提前在第一个 } 截断。
-        const sm = html.match(/<script[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*([\s\S]*?)<\/script>/i);
-        if (sm) {
-          try {
-            const state = JSON.parse(sm[1].trim().replace(/;\s*$/, ''));
-            const note = findNote(state, id);
-            if (note && note.desc) {
-              return {
-                desc: unesc(note.desc),
-                title: unesc(note.title || ''),
-                time: note.time || note.create_time || 0,
-                liked: (note.interact_info && note.interact_info.liked_count) || '',
-                user: (note.user && (note.user.nickname || note.user.username)) || '',
-                tags: Array.isArray(note.tag_list) ? note.tag_list.map(function (t) { return t && (t.name || t); }).filter(Boolean) : [],
-                images: Array.isArray(note.image_list) ? note.image_list.map(function (im) { return im.url || im; }).filter(Boolean) : []
-              };
-            }
-          } catch (e) { /* JSON 解析失败，继续 2b */ }
-        }
-
-        // 2b) og:description 兜底（部分页面仍有）
-        const om = html.match(/<meta[^>]*property\s*=\s*["']og:description["'][^>]*>/i);
-        let og = '';
-        if (om) { const c = om[0].match(/content\s*=\s*["']([^"']*)["']/i); if (c) og = c[1]; }
-        const ogTitle = (html.match(/<meta[^>]*property\s*=\s*["']og:title["'][^>]*content\s*=\s*["']([^"']*)["']/i) || [])[1] || '';
-        const desc = unesc(og), title = unesc(ogTitle);
-        if (desc || title) return { desc: desc, title: title, time: 0, liked: '', user: '', tags: [], images: [] };
+        const fr = await loadInFrame(id);
+        if (fr) return fr;
       } catch (e) { /* 放弃这条 */ }
 
       return null;
@@ -259,7 +277,7 @@
       await enrichDetails(ctrl);
       const filled = cap.filter(function (c) { return (c.desc || '').trim(); }).length;
       if (filled === 0 && cap.length > 0) {
-        ctrl.finalTip = '⚠️ 抓到 ' + cap.length + ' 条，但一条正文都没拿到。\n小红书把这台浏览器的详情接口挡住了。\n请改用：在收藏页点进任意一篇帖子→等正文加载→再点导出；或联系王主管换更硬的方案。';
+        ctrl.finalTip = '⚠️ 抓到 ' + cap.length + ' 条，但一条正文都没拿到。\n小红书把 iframe/接口都挡了。\n请改用：在收藏页点进任意一篇帖子→等正文加载→再点导出；或联系王主管换更硬的方案。';
       }
       return download({
         source: 'xiaohongshu_collect',
