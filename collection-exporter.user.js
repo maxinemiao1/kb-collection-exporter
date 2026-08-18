@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         全能收藏导出器（小红书 / B站 / 百度网盘）v2.0
+// @name         全能收藏导出器（小红书 / B站 / 百度网盘）v3.0
 // @namespace    http://workbuddy.ai/
-// @version      2.0
-// @description  在小红书收藏页 / B站收藏夹 / 百度网盘 导出收藏为 JSON（本地生成，Cookie 不出浏览器）。带实时条数显示与「停止并导出」按钮。
+// @version      3.0
+// @description  导出收藏为 JSON。v3 关键升级：小红书在已登录浏览器里逐条抓正文 desc（仅列表接口返回的内容是空的，必须再请求详情接口）。带实时条数 + 中途停止。B站/网盘保持原样（其接口本身返回 desc/路径）。
 // @author       王经理 (WorkBuddy)
 // @match        https://www.xiaohongshu.com/*
 // @match        https://edith.xiaohongshu.com/*
@@ -35,7 +35,6 @@
     return data.count;
   }
 
-  // 滚动加载到底；stopFn() 返回 true 时立即中断；tickFn() 每滚一次回调（用于刷新条数）
   function scrollDown(stopFn, tickFn) {
     return (async function () {
       let lh = 0, s = 0;
@@ -51,8 +50,6 @@
     })();
   }
 
-  // 统一按钮：空闲态「📥 导出」→ 运行中「⏹ 停止 (N条)」→ 点停止则中断并导出已抓部分
-  // run(ctrl) 为异步抓取逻辑，需自行调用 scrollDown(ctrl.stop, ctrl.tick) 并 return 条数
   function makeExporter(color, idleText, tipBase, run) {
     const st = { running: false, stopped: false };
     const btn = document.createElement('div');
@@ -63,23 +60,22 @@
     const tip = document.createElement('div');
     tip.style.cssText = 'position:fixed;right:16px;bottom:56px;z-index:99999;background:#222;color:#fff;' +
       'padding:6px 12px;border-radius:10px;font:12px/1.4 -apple-system,"PingFang SC",sans-serif;' +
-      'max-width:280px;box-shadow:0 4px 14px rgba(0,0,0,.25);display:none;white-space:pre-line;';
+      'max-width:300px;box-shadow:0 4px 14px rgba(0,0,0,.25);display:none;white-space:pre-line;';
     function mount() {
       if (!document.body.contains(btn)) { document.body.appendChild(btn); document.body.appendChild(tip); }
     }
     if (document.body) mount(); else window.addEventListener('load', mount);
 
-    const ctrl = {
-      stop: function () { return st.stopped; },
-      tick: function () {}
-    };
     btn.addEventListener('click', async function () {
       if (!st.running) {
         st.running = true; st.stopped = false;
-        btn.textContent = '⏹ 停止 (0 条)';
+        btn.textContent = '⏹ 停止 (0)';
         tip.style.display = 'block';
-        tip.textContent = tipBase + '\n已抓 0 条（点按钮可随时停止并导出）';
-        ctrl.tick = function () { btn.textContent = '⏹ 停止 (' + (window.__capLen || 0) + ' 条)'; };
+        const ctrl = {
+          stop: function () { return st.stopped; },
+          setBtn: function (t) { btn.textContent = t; },
+          setTip: function (t) { tip.textContent = t; }
+        };
         const c = await run(ctrl);
         st.running = false;
         btn.textContent = '📥 再导一次 (' + c + ')';
@@ -99,14 +95,14 @@
       const u = typeof a[0] === 'string' ? a[0] : (a[0] && a[0].url) || '';
       return of.apply(this, a).then(function (r) {
         try {
-          if (matcher.test(u)) r.clone().json().then(function (d) { walker(d); }).catch(function () {});
+          if (matcher.test(u)) r.clone().json().then(function (d) { walker(d); });
         } catch (e) {}
         return r;
       });
     };
   }
 
-  // ===================== 小红书 =====================
+  // ===================== 小红书 v3：阶段1抓列表 + 阶段2逐条抓正文 =====================
   if (isXHS) {
     const cap = [], seen = new Set();
     function pushN(n) {
@@ -114,21 +110,16 @@
       const id = String(n.note_id || n.id || '');
       if (!id || seen.has(id)) return;
       seen.add(id);
-      let cover = n.cover || '';
-      if (!cover && n.cover_info && n.cover_info.url) cover = n.cover_info.url;
-      let liked = n.liked_count || '';
-      if (!liked && n.interact_info) liked = n.interact_info.liked_count || '';
-      let user = '';
-      if (n.user) user = n.user.nickname || n.user.username || '';
       cap.push({
         id: id,
         title: n.title || n.display_title || '',
         desc: n.desc || n.description || '',
-        user: user,
-        cover: cover,
-        liked: liked,
+        user: (n.user && (n.user.nickname || n.user.username)) || '',
+        cover: n.cover || ((n.cover_info && n.cover_info.url) || ''),
+        liked: n.liked_count || ((n.interact_info && n.interact_info.liked_count) || ''),
         url: 'https://www.xiaohongshu.com/explore/' + id,
-        time: n.time || n.create_time || ''
+        time: n.time || n.create_time || '',
+        tags: Array.isArray(n.tag_list) ? n.tag_list.map(function(t){ return t.name || t; }).filter(Boolean) : []
       });
     }
     function walk(o) {
@@ -152,17 +143,68 @@
       });
     }
     hookFetch(/note|collect|feed|v1\//, walk);
-    makeExporter('#ff2e4d', '📥 导出收藏', '小红书：正在滚动加载收藏…', async function (ctrl) {
-      window.__capLen = cap.length;
-      const _push = pushN;
-      await scrollDown(ctrl.stop, function () { window.__capLen = cap.length; });
+
+    // 阶段2：逐条拉详情，把 desc/tags/interact 补全
+    async function enrichDetails(ctrl) {
+      const ids = cap.map(function (c) { return c.id; });
+      for (let i = 0; i < ids.length; i++) {
+        if (ctrl.stop()) break;
+        const id = ids[i];
+        ctrl.setBtn('⏹ 抓详情 ' + (i + 1) + '/' + ids.length);
+        ctrl.setTip('小红书：阶段2 抓取正文（需要已登录）…\n' + (i + 1) + '/' + ids.length + '（点按钮可随时停）');
+        try {
+          const r = await fetch('/api/sns/web/v1/feed', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              source_note_id: id,
+              image_formats: ['jpg', 'webp', 'avif'],
+              extra: { need_body_topic: '1' }
+            })
+          });
+          const d = await r.json();
+          const item = (d && d.data && d.data.items || []).find(function (it) { return it && it.note && String(it.note.note_id) === id; });
+          if (item && item.note) {
+            const n = item.note;
+            const entry = cap.find(function (c) { return c.id === id; });
+            if (entry) {
+              entry.desc = n.desc || entry.desc || '';
+              entry.title = n.title || entry.title;
+              entry.time = n.time || entry.time;
+              entry.liked = (n.interact_info && n.interact_info.liked_count) || entry.liked;
+              if (n.user && n.user.nickname) entry.user = n.user.nickname;
+              if (Array.isArray(n.tag_list)) entry.tags = n.tag_list.map(function (t) { return t && (t.name || t); }).filter(Boolean);
+              if (Array.isArray(n.image_list) && n.image_list.length) entry.images = n.image_list.map(function (im) { return im.url || im; }).filter(Boolean);
+            }
+          }
+        } catch (e) { /* 单条失败不影响其余 */ }
+        await sleep(350); // 礼貌节流，避免触发反爬
+      }
+    }
+
+    makeExporter('#ff2e4d', '📥 导出收藏', '小红书：阶段1 滚动抓取列表…', async function (ctrl) {
+      await scrollDown(ctrl.stop, null);
       dom();
-      window.__capLen = cap.length;
-      return download({ source: 'xiaohongshu_collect', exportedAt: new Date().toISOString(), count: cap.length, notes: cap }, 'xiaohongshu_collect_' + Date.now() + '.json');
+      ctrl.setBtn('⏹ 阶段1 已抓 ' + cap.length + '，准备抓详情…');
+      ctrl.setTip('小红书：阶段1 完成，共 ' + cap.length + ' 条。\n开始阶段2 抓正文（已登录的浏览器才会有正文）。\n点按钮可随时停止并导出当前内容。');
+      await enrichDetails(ctrl);
+      return download({
+        source: 'xiaohongshu_collect',
+        exportedAt: new Date().toISOString(),
+        count: cap.length,
+        notes: cap.map(function (c) {
+          return {
+            id: c.id, title: c.title, desc: c.desc || '',
+            tags: c.tags, user: c.user, cover: c.cover,
+            images: c.images || [], liked: c.liked,
+            url: c.url, time: c.time
+          };
+        })
+      }, 'xiaohongshu_collect_' + Date.now() + '.json');
     });
   }
 
-  // ===================== B站 =====================
+  // ===================== B站：接口本身带 intro/desc，保持原逻辑 =====================
   else if (isBili) {
     const cap = [], seen = new Set();
     function push(n) {
@@ -208,15 +250,14 @@
     }
     hookFetch(/fav|x\/v3\/fav|x\/v2\/history|watchlater/, walk);
     makeExporter('#fb7299', '📥 导出B站收藏', 'B站：正在滚动加载收藏夹…', async function (ctrl) {
-      window.__capLen = cap.length;
-      await scrollDown(ctrl.stop, function () { window.__capLen = cap.length; });
+      await scrollDown(ctrl.stop, null);
+      ctrl.setBtn('⏹ 停止 (' + cap.length + ')');
       dom();
-      window.__capLen = cap.length;
       return download({ source: 'bilibili_fav', exportedAt: new Date().toISOString(), count: cap.length, notes: cap }, 'bilibili_fav_' + Date.now() + '.json');
     });
   }
 
-  // ===================== 百度网盘 =====================
+  // ===================== 百度网盘：清单不需要正文，保持原逻辑 =====================
   else if (isPan) {
     const cap = [], seen = new Set();
     function push(n) {
@@ -258,10 +299,9 @@
     }
     hookFetch(/pan\.baidu\.com\/api\/(list|filemetas)/, walk);
     makeExporter('#2e7fff', '📥 导出网盘清单', '网盘：正在滚动加载文件清单…', async function (ctrl) {
-      window.__capLen = cap.length;
-      await scrollDown(ctrl.stop, function () { window.__capLen = cap.length; });
+      await scrollDown(ctrl.stop, null);
+      ctrl.setBtn('⏹ 停止 (' + cap.length + ')');
       dom();
-      window.__capLen = cap.length;
       return download({ source: 'baidu_pan_list', note: '仅文件索引清单，未下载任何文件内容', exportedAt: new Date().toISOString(), count: cap.length, files: cap }, 'baidu_pan_' + Date.now() + '.json');
     });
   }
