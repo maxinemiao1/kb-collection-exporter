@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         全能收藏导出器（小红书 / B站 / 百度网盘）v3.0
+// @name         全能收藏导出器（小红书 / B站 / 百度网盘）v3.1
 // @namespace    http://workbuddy.ai/
-// @version      3.0
-// @description  导出收藏为 JSON。v3 关键升级：小红书在已登录浏览器里逐条抓正文 desc（仅列表接口返回的内容是空的，必须再请求详情接口）。带实时条数 + 中途停止。B站/网盘保持原样（其接口本身返回 desc/路径）。
+// @version      3.1
+// @description  导出收藏为 JSON。v3.1 关键修复：小红书正文改为“监听详情接口响应”(接口由浏览器原生签名，绕过反爬与 DOM 选择器)，点开帖子即自动采集，支持被动累积。带实时条数 + 中途停止。B站/网盘保持原样。
 // @author       王经理 (WorkBuddy)
 // @match        https://www.xiaohongshu.com/*
 // @match        https://edith.xiaohongshu.com/*
@@ -108,6 +108,7 @@
   // ===================== 小红书 v3：阶段1抓列表 + 阶段2逐条抓正文 =====================
   if (isXHS) {
     const cap = [], seen = new Set();
+    const detailMap = new Map();   // note_id -> 含 desc 的详情对象，来自详情接口响应
     function pushN(n) {
       if (!n) return;
       const id = String(n.note_id || n.id || '');
@@ -128,7 +129,10 @@
     function walk(o) {
       if (!o || typeof o !== 'object') return;
       if (Array.isArray(o)) { o.forEach(walk); return; }
-      if (o.note_id || (o.id && (o.title || o.desc))) pushN(o);
+      if (o.note_id && (o.title || o.desc)) {
+        if (o.desc && o.desc.trim()) detailMap.set(String(o.note_id), o);   // 详情响应：留正文
+        else if (!seen.has(String(o.note_id))) pushN(o);                    // 列表响应：仅占位
+      }
       for (const k in o) if (o[k] && typeof o[k] === 'object') walk(o[k]);
     }
     function dom() {
@@ -147,92 +151,47 @@
     }
     hookFetch(/note|collect|feed|v1\//, walk);
 
-    // 阶段2：逐条拉详情，把 desc/tags/interact 补全
-    // 双保险：1) 试详情 API；2) API 没拿到 desc 就抓帖子页 HTML 的 og:description
-    function unesc(s) {
-      return (s || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    }
-    // 在 __INITIAL_STATE__ 里递归找 note_id 匹配且有 desc 的对象（结构随版本变，用递归最稳）
-    function findNote(obj, id) {
-      if (!obj || typeof obj !== 'object') return null;
-      if (Array.isArray(obj)) { for (let i = 0; i < obj.length; i++) { const r = findNote(obj[i], id); if (r) return r; } return null; }
-      if (obj.note_id && String(obj.note_id) === id && typeof obj.desc === 'string' && obj.desc.trim()) return obj;
-      for (const k in obj) { const r = findNote(obj[k], id); if (r) return r; }
+    // 阶段2：让“浏览器自己”去请求详情接口（带正确签名），我们监听响应拿 desc。
+    // 根因复盘：之前 detail 响应其实被 hook 抓到了，但 pushN 的 seen 守卫把已存在条目直接跳过，
+    // 且 enrichOne 只信 DOM 抓取(被反爬挡掉)，导致正文“抓到又丢弃”。
+    // 现改为：详情响应统一进 detailMap；阶段2 点开卡片触发接口→响应进 detailMap→合并回 cap。
+    function findCard(id) {
+      const sel = 'a[href*="/explore/' + id + '"], a[href*="/discovery/item/' + id + '"]';
+      const a = document.querySelector(sel);
+      if (a) return a;
+      const all = document.querySelectorAll('a[href*="/explore/"], a[href*="/discovery/item/"]');
+      for (let i = 0; i < all.length; i++) { if ((all[i].getAttribute('href') || '').indexOf(id) >= 0) return all[i]; }
       return null;
     }
-    // 直接 fetch/iframe 打开 /explore/{id} 会被小红书反爬墙（302 跳"笔记暂时无法浏览"）。
-    // 唯一能过验证的是"在列表/收藏页点开帖子"这种 App 内部跳转。所以这里模拟真人点击卡片→抓弹窗正文→关掉。
-    async function scrapeViaClick(id, ctrl) {
-      function findCard() {
-        const sel = 'a[href*="/explore/' + id + '"], a[href*="/discovery/item/' + id + '"]';
-        const a = document.querySelector(sel);
-        if (a) return a;
-        const all = document.querySelectorAll('a[href*="/explore/"], a[href*="/discovery/item/"]');
-        for (let i = 0; i < all.length; i++) { if ((all[i].getAttribute('href') || '').indexOf(id) >= 0) return all[i]; }
-        return null;
-      }
-      const card = findCard();
-      if (!card) return null;
+    async function triggerDetail(id) {
+      if (detailMap.has(id)) return true;
+      const card = findCard(id);
+      if (!card) return false;
       const before = location.href;
-      try { card.click(); } catch (e) { return null; }
-      let got = null;
-      for (let i = 0; i < 20; i++) {            // 最多 ~8s 等正文渲染
+      try { card.click(); } catch (e) { return false; }
+      for (let i = 0; i < 20; i++) {            // 等详情接口响应被 hook 写入 detailMap，最多 ~8s
+        if (detailMap.has(id)) break;
         await sleep(400);
-        const el = document.querySelector('#detail-desc, .note-content, .desc, [class*="noteText"], [class*="note-content"]');
-        if (el && el.innerText && el.innerText.trim()) { got = el.innerText.trim(); break; }
       }
-      // 恢复现场：弹窗按 Esc，整页跳转则后退
-      try {
+      try {                                       // 关闭弹窗/回退，恢复现场
         if (location.href === before) document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
         else history.back();
       } catch (e) {}
-      await sleep(450);
-      if (!got) return null;
-      let title = '', user = '';
-      try {
-        const t = document.querySelector('#detail-title, .note-detail-title, .title');
-        if (t) title = t.innerText.trim();
-        const u = document.querySelector('.author-wrapper .name, .username, [class*="author"] .name');
-        if (u) user = u.innerText.trim();
-      } catch (e) {}
-      return { desc: got, title: title, time: 0, liked: '', user: user, tags: [], images: [] };
+      await sleep(400);
+      return detailMap.has(id);
     }
-    async function enrichOne(id) {
-      // 1) 详情 API（需要登录 cookie；可能因缺签名头失败）
-      try {
-        const r = await fetch('/api/sns/web/v1/feed', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            source_note_id: id,
-            image_formats: ['jpg', 'webp', 'avif'],
-            extra: { need_body_topic: '1' }
-          })
-        });
-        const d = await r.json();
-        const items = (d && d.data && d.data.items) || [];
-        const item = items.find(function (it) { return it && it.note && String(it.note.note_id) === id; });
-        if (item && item.note && item.note.desc) {
-          const n = item.note;
-          return {
-            desc: n.desc,
-            title: n.title || '',
-            time: n.time || 0,
-            liked: (n.interact_info && n.interact_info.liked_count) || '',
-            user: (n.user && n.user.nickname) || '',
-            tags: Array.isArray(n.tag_list) ? n.tag_list.map(function (t) { return t && (t.name || t); }).filter(Boolean) : [],
-            images: Array.isArray(n.image_list) ? n.image_list.map(function (im) { return im.url || im; }).filter(Boolean) : []
-          };
-        }
-      } catch (e) { /* 继续走 fallback */ }
-
-      // 2) Fallback：模拟真人点开帖子卡片，抓弹窗/正文 DOM（能过反爬墙，fetch/iframe 都不行）
-      try {
-        const fr = await scrapeViaClick(id, ctrl);
-        if (fr) return fr;
-      } catch (e) { /* 放弃这条 */ }
-
-      return null;
+    function mergeDetail(id) {
+      const n = detailMap.get(id);
+      if (!n) return;
+      const e = cap.find(function (c) { return c.id === id; });
+      if (!e) return;
+      if (n.desc && n.desc.trim()) e.desc = n.desc;
+      if (n.title) e.title = n.title;
+      if (n.time || n.create_time) e.time = n.time || n.create_time;
+      if (n.liked_count || (n.interact_info && n.interact_info.liked_count)) e.liked = n.liked_count || (n.interact_info && n.interact_info.liked_count);
+      if (n.user && (n.user.nickname || n.user.username)) e.user = n.user.nickname || n.user.username;
+      if (Array.isArray(n.tag_list) && n.tag_list.length) e.tags = n.tag_list.map(function (t) { return t.name || t; }).filter(Boolean);
+      if (Array.isArray(n.image_list) && n.image_list.length) e.images = n.image_list.map(function (im) { return im.url || im; }).filter(Boolean);
     }
     async function enrichDetails(ctrl) {
       const ids = cap.map(function (c) { return c.id; });
@@ -240,21 +199,10 @@
         if (ctrl.stop()) break;
         const id = ids[i];
         ctrl.setBtn('⏹ 抓详情 ' + (i + 1) + '/' + ids.length);
-        ctrl.setTip('小红书：阶段2 逐篇点开抓正文…\n' + (i + 1) + '/' + ids.length + '（会自动开/关帖子，别手动操作，点按钮可随时停）');
-        const got = await enrichOne(id);
-        if (got) {
-          const entry = cap.find(function (c) { return c.id === id; });
-          if (entry) {
-            if (got.desc) entry.desc = got.desc;
-            if (got.title) entry.title = got.title;
-            if (got.time) entry.time = got.time;
-            if (got.liked) entry.liked = got.liked;
-            if (got.user) entry.user = got.user;
-            if (got.tags && got.tags.length) entry.tags = got.tags;
-            if (got.images && got.images.length) entry.images = got.images;
-          }
-        }
-        await sleep(350); // 礼貌节流，避免触发反爬
+        ctrl.setTip('小红书：阶段2 逐篇点开触发详情接口…\n' + (i + 1) + '/' + ids.length + '（会自动开/关帖子，别手动操作，点按钮可随时停）');
+        if (!detailMap.has(id)) await triggerDetail(id);
+        mergeDetail(id);
+        await sleep(300);
       }
     }
 
@@ -262,11 +210,11 @@
       await scrollDown(ctrl.stop, null);
       dom();
       ctrl.setBtn('⏹ 阶段1 已抓 ' + cap.length + '，准备抓详情…');
-      ctrl.setTip('小红书：阶段1 完成，共 ' + cap.length + ' 条。\n开始阶段2 抓正文（已登录的浏览器才会有正文）。\n点按钮可随时停止并导出当前内容。');
+      ctrl.setTip('小红书：阶段1 完成，共 ' + cap.length + ' 条。\n开始阶段2 抓正文（监听详情接口响应，绕过签名与反爬墙）。\n点按钮可随时停止并导出当前内容。');
       await enrichDetails(ctrl);
       const filled = cap.filter(function (c) { return (c.desc || '').trim(); }).length;
       if (filled === 0 && cap.length > 0) {
-        ctrl.finalTip = '⚠️ 抓到 ' + cap.length + ' 条，但一条正文都没拿到。\n小红书把接口/iframe 都挡了，自动点开也失败。\n请改用：在收藏页手动点进任意一篇帖子→等正文加载→再点导出；或联系王主管换更硬的方案。';
+        ctrl.finalTip = '⚠️ 抓到 ' + cap.length + ' 条，但一条正文都没拿到。\n可能是点开没触发详情接口，或接口路径已变。\n可改“被动采集”：在收藏页逐篇点开帖子(等加载完)→再点“再导一次”，脚本会采集你打开过的帖。';
       }
       return download({
         source: 'xiaohongshu_collect',
