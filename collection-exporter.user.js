@@ -129,9 +129,13 @@
     function walk(o) {
       if (!o || typeof o !== 'object') return;
       if (Array.isArray(o)) { o.forEach(walk); return; }
-      if (o.note_id && (o.title || o.desc)) {
-        if (o.desc && o.desc.trim()) detailMap.set(String(o.note_id), o);   // 详情响应：留正文
-        else if (!seen.has(String(o.note_id))) pushN(o);                    // 列表响应：仅占位
+      const id = o.note_id || o.id;
+      if (id) {
+        if (o.desc && String(o.desc).trim()) {
+          detailMap.set(String(id), o);                 // 详情响应：带正文，存起来后面合并
+        } else if (o.title || o.display_title) {
+          if (!seen.has(String(id))) pushN(o);          // 列表响应：仅有 note_id+标题，占位（无正文）
+        }
       }
       for (const k in o) if (o[k] && typeof o[k] === 'object') walk(o[k]);
     }
@@ -213,7 +217,9 @@
       ctrl.setTip('小红书：阶段1 完成，共 ' + cap.length + ' 条。\n开始阶段2 抓正文（监听详情接口响应，绕过签名与反爬墙）。\n点按钮可随时停止并导出当前内容。');
       await enrichDetails(ctrl);
       const filled = cap.filter(function (c) { return (c.desc || '').trim(); }).length;
-      if (filled === 0 && cap.length > 0) {
+      if (cap.length === 0) {
+        ctrl.finalTip = '⚠️ 阶段1 一条都没抓到。\n请确认：① 你在「收藏」列表页（不是首页/发现页）；② 已登录；③ 列表已向下滚动加载出内容；④ 脚本已生效（右下角有红色「📥 导出收藏」按钮）。\n重新刷新页面后再点导出。';
+      } else if (filled === 0 && cap.length > 0) {
         ctrl.finalTip = '⚠️ 抓到 ' + cap.length + ' 条，但一条正文都没拿到。\n可能是点开没触发详情接口，或接口路径已变。\n可改“被动采集”：在收藏页逐篇点开帖子(等加载完)→再点“再导一次”，脚本会采集你打开过的帖。';
       }
       return download({
