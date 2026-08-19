@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         全能收藏导出器（小红书 / B站 / 百度网盘）v3.1
+// @name         全能收藏导出器（小红书 / B站 / 百度网盘）v3.2
 // @namespace    http://workbuddy.ai/
-// @version      3.1
+// @version      3.2
 // @description  导出收藏为 JSON。v3.1 关键修复：小红书正文改为“监听详情接口响应”(接口由浏览器原生签名，绕过反爬与 DOM 选择器)，点开帖子即自动采集，支持被动累积。带实时条数 + 中途停止。B站/网盘保持原样。
 // @author       王经理 (WorkBuddy)
 // @match        https://www.xiaohongshu.com/*
